@@ -19,7 +19,11 @@ type Addition struct {
 	ClientID             string `json:"client_id" required:"false" help:"Keep it empty if you don't have one"`
 	ClientSecret         string `json:"client_secret" required:"false" help:"Keep it empty if you don't have one"`
 
-	// 115 配置
+	// 115 登录配置
+	Cookie115            string `json:"cookie_115" type:"text" help:"115 Cookie，与 QRCode 二选一"`
+	QRCodeToken115       string `json:"qrcode_token_115" type:"text" help:"115 QR Code Token，与 Cookie 二选一"`
+	QRCodeSource115      string `json:"qrcode_source_115" type:"select" options:"web,android,ios,tv,alipaymini,wechatmini,qandroid" default:"linux" help:"QR 设备类型"`
+	LimitRate115         float64 `json:"limit_rate_115" type:"float" default:"2" help:"115 API 限速"`
 	TargetFolder115      string `json:"target_folder_115" default:"0" help:"115 目标文件夹 ID，用于保存转存的文件"`
 }
 

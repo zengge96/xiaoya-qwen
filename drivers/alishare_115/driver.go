@@ -2,6 +2,7 @@ package alishare_115
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,9 +10,12 @@ import (
 
 	"github.com/alist-org/alist/v3/drivers/aliyundrive_share2open"
 	"github.com/alist-org/alist/v3/drivers/official_115"
+	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
+
 	driver115 "github.com/xiaoyaliu00/115driver/pkg/driver"
 )
 
@@ -20,7 +24,8 @@ type AliShare115 struct {
 	Addition
 
 	aliShare *aliyundrive_share2open.AliyundriveShare2Open
-	pan115   *official_115.Pan115
+	client   *driver115.Pan115Client
+	limiter  *rate.Limiter
 
 	// file_id → 115 下载直链缓存
 	link115Cache map[string]string
@@ -39,7 +44,7 @@ func (d *AliShare115) Init(ctx context.Context) error {
 
 	// ── 初始化阿里云盘分享驱动 ──
 	d.aliShare = &aliyundrive_share2open.AliyundriveShare2Open{}
-	d.aliShare.Storage = d.Storage // 共享 MountPath 等
+	d.aliShare.Storage = d.Storage
 	d.aliShare.Addition = aliyundrive_share2open.Addition{
 		RefreshToken:         d.RefreshToken,
 		RefreshTokenOpen:     d.RefreshTokenOpen,
@@ -57,24 +62,61 @@ func (d *AliShare115) Init(ctx context.Context) error {
 		return fmt.Errorf("init aliyun share failed: %w", err)
 	}
 
-	// ── 查找系统中已有的 official_115 存储 ──
-	d.pan115 = d.findPan115()
-	if d.pan115 == nil {
-		fmt.Printf("[alishare_115] 警告: 未找到 official_115 存储，将回退到阿里云直链\n")
-	} else {
-		fmt.Printf("[alishare_115] 已绑定 115 存储: %s\n", d.pan115.MountPath)
+	// ── 初始化 115 客户端 ──
+	if err := d.init115Client(); err != nil {
+		return fmt.Errorf("init 115 client failed: %w", err)
 	}
 
+	if d.LimitRate115 > 0 {
+		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate115), 1)
+	}
+
+	fmt.Printf("[alishare_115] 初始化完成, 115 客户端已就绪\n")
 	return nil
 }
 
-// findPan115 在系统存储中查找 official_115 驱动实例
-func (d *AliShare115) findPan115() *official_115.Pan115 {
-	storages := op.GetAllStorages()
-	for _, s := range storages {
-		if p, ok := s.(*official_115.Pan115); ok {
-			return p
+// init115Client 内部初始化 115 客户端（不注册存储，纯客户端模式）
+func (d *AliShare115) init115Client() error {
+	if d.Cookie115 == "" && d.QRCodeToken115 == "" {
+		return errors.New("115 cookie 或 qrcode_token 必须提供其一")
+	}
+
+	// 先获取最新 appVer
+	official_115.InitAppVerOnce()
+
+	ua := fmt.Sprintf("Mozilla/5.0 115Browser/%s", official_115.GetAppVer())
+	opts := []driver115.Option{
+		driver115.UA(ua),
+		func(c *driver115.Pan115Client) {
+			c.Client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify})
+		},
+	}
+	d.client = driver115.New(opts...)
+
+	cr := &driver115.Credential{}
+	var err error
+
+	if d.QRCodeToken115 != "" {
+		s := &driver115.QRCodeSession{UID: d.QRCodeToken115}
+		if cr, err = d.client.QRCodeLoginWithApp(s, driver115.LoginApp(d.QRCodeSource115)); err != nil {
+			return errors.Wrap(err, "115 QR code login failed")
 		}
+		// 保存解析出的 cookie（不写入数据库，仅本实例使用）
+		d.Cookie115 = fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", cr.UID, cr.CID, cr.SEID, cr.KID)
+		d.QRCodeToken115 = ""
+	} else if d.Cookie115 != "" {
+		if err = cr.FromCookie(d.Cookie115); err != nil {
+			return errors.Wrap(err, "115 cookie parse failed")
+		}
+		d.client.ImportCredential(cr)
+	}
+
+	return d.client.LoginCheck()
+}
+
+func (d *AliShare115) waitLimit(ctx context.Context) error {
+	if d.limiter != nil {
+		return d.limiter.Wait(ctx)
 	}
 	return nil
 }
@@ -104,19 +146,13 @@ func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkA
 		return d.make115Link(link)
 	}
 
-	// 2. 如果没有115客户端，直接回退
-	if d.pan115 == nil {
-		fmt.Printf("[alishare_115] 无115存储，回退阿里云直链: %s\n", fileName)
-		return d.aliShare.Link(ctx, file, args)
-	}
-
-	// 3. 获取阿里云直链（同时会填充 Hash_dict）
+	// 2. 获取阿里云直链（同时会填充 Hash_dict）
 	aliLink, err := d.aliShare.Link(ctx, file, args)
 	if err != nil {
 		return nil, fmt.Errorf("获取阿里云直链失败: %w", err)
 	}
 
-	// 4. 获取 SHA1 hash
+	// 3. 获取 SHA1 hash
 	sha1Hash := d.aliShare.GetHash(ctx, file, args)
 	if sha1Hash == "" {
 		fmt.Printf("[alishare_115] 获取 SHA1 失败，回退阿里云直链: %s\n", fileName)
@@ -124,13 +160,20 @@ func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkA
 	}
 	sha1Hash = strings.ToUpper(sha1Hash)
 
-	// 5. 构造 urlFileStreamer，用于115秒传
+	// 4. 构造 urlFileStreamer，用于115秒传
 	fileSize := file.GetSize()
 	stream := official_115.NewUrlFileStreamer(fileName, fileSize, sha1Hash, aliLink.URL)
 
-	// 6. 秒传到115
+	// 5. 限速等待
+	if err := d.waitLimit(ctx); err != nil {
+		return aliLink, nil
+	}
+
+	// 6. 秒传到115（构造临时 Pan115 以复用其 Put 逻辑）
+	pan := &official_115.Pan115{}
+	pan.SetClient(d.client)
 	targetDir := &model.Object{ID: d.TargetFolder115, IsFolder: true}
-	putResult, err := d.pan115.Put(ctx, targetDir, stream, nil)
+	putResult, err := pan.Put(ctx, targetDir, stream, nil)
 	if err != nil {
 		fmt.Printf("[alishare_115] 115秒传失败，回退阿里云直链: %s, err: %v\n", fileName, err)
 		return aliLink, nil
@@ -143,7 +186,7 @@ func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkA
 		return aliLink, nil
 	}
 
-	dlInfo, err := d.pan115.GetDriverClient().DownloadWithUA(fileObj115.PickCode, args.Header.Get("User-Agent"))
+	dlInfo, err := d.client.DownloadWithUA(fileObj115.PickCode, args.Header.Get("User-Agent"))
 	if err != nil {
 		fmt.Printf("[alishare_115] 获取115直链失败，回退阿里云直链: %s, err: %v\n", fileName, err)
 		return aliLink, nil
@@ -179,7 +222,7 @@ func (d *AliShare115) GetHash(ctx context.Context, file model.Obj, args model.Li
 	return d.aliShare.GetHash(ctx, file, args)
 }
 
-// purge115Cache 定时清理115链接缓存（每3分钟，与 aliyundrive_share2open 一致）
+// purge115Cache 清理115链接缓存
 func (d *AliShare115) purge115Cache() {
 	if len(d.link115Cache) > 0 {
 		fmt.Printf("[alishare_115] %s 清空115链接缓存 (%d 条): %s\n",

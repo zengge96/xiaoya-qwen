@@ -46,6 +46,17 @@ func (d *Pan115) initAppVer() {
 	log.Debugf("use app version: %v", appVer)
 }
 
+// GetAppVer returns the current app version (exported for alishare_115).
+func GetAppVer() string {
+	return appVer
+}
+
+// InitAppVerOnce fetches the latest app version from 115 API (package-level).
+func InitAppVerOnce() {
+	tmp := &Pan115{}
+	tmp.appVerOnce.Do(tmp.initAppVer)
+}
+
 type VersionResp struct {
 	Error string   `json:"error,omitempty"`
 	Data  Versions `json:"data"`

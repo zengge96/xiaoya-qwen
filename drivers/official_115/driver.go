@@ -238,4 +238,9 @@ func (d *Pan115) GetDriverClient() *driver115.Pan115Client {
 	return d.client
 }
 
+// SetClient injects an external Pan115Client (used by alishare_115).
+func (d *Pan115) SetClient(c *driver115.Pan115Client) {
+	d.client = c
+}
+
 var _ driver.Driver = (*Pan115)(nil)
