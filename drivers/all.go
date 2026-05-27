@@ -3,6 +3,7 @@ package drivers
 import (
 	_ "github.com/alist-org/alist/v3/drivers/115"
 	_ "github.com/alist-org/alist/v3/drivers/115_share"
+	_ "github.com/alist-org/alist/v3/drivers/alishare_115"
 	_ "github.com/alist-org/alist/v3/drivers/alist_v2"
 	_ "github.com/alist-org/alist/v3/drivers/alist_v3"
 	_ "github.com/alist-org/alist/v3/drivers/alias"
