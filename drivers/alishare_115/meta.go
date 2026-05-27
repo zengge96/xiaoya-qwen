@@ -6,7 +6,7 @@ import (
 )
 
 type Addition struct {
-	// ── Aliyun share fields (same as aliyundrive_share2open) ──
+	// ── Aliyun share (same fields as aliyundrive_share2open.Addition) ──
 	RefreshToken         string `json:"RefreshToken" required:"true"`
 	RefreshTokenOpen     string `json:"RefreshTokenOpen" required:"true"`
 	TempTransferFolderID string `json:"TempTransferFolderID" default:"root"`
@@ -19,7 +19,7 @@ type Addition struct {
 	ClientID       string `json:"client_id" required:"false" help:"Keep it empty if you don't have one"`
 	ClientSecret   string `json:"client_secret" required:"false" help:"Keep it empty if you don't have one"`
 
-	// ── 115 fields ──
+	// ── 115 ──
 	Cookie115       string `json:"cookie_115" type:"text" required:"true" help:"115网盘cookie"`
 	TargetFolder115 string `json:"target_folder_115" default:"0" help:"115上传目标目录ID，0=根目录"`
 }

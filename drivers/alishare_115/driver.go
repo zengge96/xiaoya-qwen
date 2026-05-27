@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/alist-org/alist/v3/drivers/aliyundrive_share2open"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -21,7 +20,7 @@ type AliShare115 struct {
 	model.Storage
 	Addition
 
-	// Delegated Aliyun driver
+	// Delegated driver — only use its exported methods/fields
 	ali *aliyundrive_share2open.AliyundriveShare2Open
 
 	// 115
@@ -31,16 +30,11 @@ type AliShare115 struct {
 
 // ── Driver interface ───────────────────────────────────────────────────
 
-func (d *AliShare115) Config() driver.Config {
-	return config
-}
+func (d *AliShare115) Config() driver.Config { return config }
 
-func (d *AliShare115) GetAddition() driver.Additional {
-	return &d.Addition
-}
+func (d *AliShare115) GetAddition() driver.Additional { return &d.Addition }
 
 func (d *AliShare115) Init(ctx context.Context) error {
-	// Create delegated Aliyun driver
 	d.ali = &aliyundrive_share2open.AliyundriveShare2Open{}
 	d.ali.Storage = d.Storage
 	d.ali.Addition = aliyundrive_share2open.Addition{
@@ -49,22 +43,17 @@ func (d *AliShare115) Init(ctx context.Context) error {
 		TempTransferFolderID: d.TempTransferFolderID,
 		ShareId:              d.ShareId,
 		SharePwd:             d.SharePwd,
+		RootID:               d.Addition.RootID,
 		OrderBy:              d.OrderBy,
 		OrderDirection:       d.OrderDirection,
 		OauthTokenURL:        d.OauthTokenURL,
 		ClientID:             d.ClientID,
 		ClientSecret:         d.ClientSecret,
 	}
-	d.ali.Addition.RootID.RootFolderID = d.Addition.RootID.RootFolderID
 	if err := d.ali.Init(ctx); err != nil {
 		return fmt.Errorf("aliyun init: %w", err)
 	}
-
-	// Init 115 client
-	if err := d.init115Client(); err != nil {
-		return fmt.Errorf("115 init: %w", err)
-	}
-	return nil
+	return d.init115Client()
 }
 
 func (d *AliShare115) Drop(ctx context.Context) error {
@@ -79,32 +68,26 @@ func (d *AliShare115) List(ctx context.Context, dir model.Obj, args model.ListAr
 }
 
 func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	// 1. Copy from share to own drive
-	newFileID, err := d.ali.Copy2Myali(ctx, d.ali.MyAliDriveId, file.GetID(), file.GetName())
-	if err != nil || newFileID == "" {
+	// 1. Get Aliyun URL via delegated driver (also populates Hash_dict)
+	aliLink, err := d.ali.Link(ctx, file, args)
+	if err != nil {
 		return d.fallbackLink()
 	}
 
-	time.Sleep(2 * time.Second)
-
-	// 2. Get Aliyun download URL + SHA1
-	downloadURL, err := d.ali.GetmyLink(ctx, newFileID, file.GetID(), file.GetName())
-	if err != nil && downloadURL == "" {
-		return d.fallbackLink()
-	}
-
-	// 3. Try 115 rapid upload
+	// 2. Try 115 rapid upload using cached SHA1
 	sha1Str := d.ali.Hash_dict[file.GetID()]
 	if sha1Str != "" {
-		if result, err := d.uploadTo115(file.GetName(), downloadURL, sha1Str, file.GetSize()); err == nil {
+		if result, err := d.uploadTo115(file.GetName(), aliLink.URL, sha1Str, file.GetSize()); err == nil {
 			if url115, err := d.get115DownloadURL(result.PickCode); err == nil && !strings.Contains(url115, "abnormal.png") {
-				return d.makeLink(url115), nil
+				// Overwrite cache with 115 URL
+				d.ali.FileID_Link[file.GetID()] = url115
+				return &model.Link{URL: url115}, nil
 			}
 		}
 	}
 
-	// 4. Fallback: return Aliyun URL
-	return d.makeLink(downloadURL), nil
+	// 3. Fallback: return Aliyun URL
+	return aliLink, nil
 }
 
 func (d *AliShare115) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
@@ -112,42 +95,19 @@ func (d *AliShare115) Other(ctx context.Context, args model.OtherArgs) (interfac
 }
 
 func (d *AliShare115) GetHash(ctx context.Context, file model.Obj, args model.LinkArgs) string {
-	if d.ali.Hash_dict != nil {
-		if hash, ok := d.ali.Hash_dict[file.GetID()]; ok {
-			return hash
-		}
-	}
-	if _, err := d.Link(ctx, file, args); err == nil {
-		if hash, ok := d.ali.Hash_dict[file.GetID()]; ok {
-			return hash
-		}
-	}
-	return ""
-}
-
-// ── Link helpers ───────────────────────────────────────────────────────
-
-func (d *AliShare115) makeLink(url string) *model.Link {
-	return &model.Link{
-		Header: http.Header{
-			"Referer": []string{"https://www.aliyundrive.com/"},
-		},
-		URL: url,
-	}
+	// Delegate to the underlying ali driver
+	return d.ali.GetHash(ctx, file, args)
 }
 
 func (d *AliShare115) fallbackLink() (*model.Link, error) {
-	return d.makeLink("http://img.xiaoya.pro/abnormal.png"), nil
+	return &model.Link{URL: "http://img.xiaoya.pro/abnormal.png"}, nil
 }
 
 // ── 115 client ─────────────────────────────────────────────────────────
 
 func (d *AliShare115) init115Client() error {
 	d.appVer = fetch115AppVer()
-	opts := []driver115.Option{
-		driver115.UA(fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer)),
-	}
-	client := driver115.New(opts...)
+	client := driver115.New(driver115.UA(fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer)))
 
 	cr := &driver115.Credential{}
 	if err := cr.FromCookie(d.Cookie115); err != nil {
@@ -158,16 +118,11 @@ func (d *AliShare115) init115Client() error {
 	if err := client.LoginCheck(); err != nil {
 		return fmt.Errorf("115 login: %w", err)
 	}
-
 	d.client115 = client
 	return nil
 }
 
 // ── 115 rapid upload ───────────────────────────────────────────────────
-
-type uploadResult struct {
-	PickCode string
-}
 
 func (d *AliShare115) uploadTo115(fileName, downloadURL, sha1Str string, fileSize int64) (*uploadResult, error) {
 	if sha1Str == "" {
@@ -179,22 +134,17 @@ func (d *AliShare115) uploadTo115(fileName, downloadURL, sha1Str string, fileSiz
 		return nil, fmt.Errorf("pre-hash: %w", err)
 	}
 
-	rs := &urlReadSeeker{
-		url:  downloadURL,
-		size: fileSize,
-		ctx:  context.Background(),
-	}
-
 	dirID := d.TargetFolder115
 	if dirID == "" {
 		dirID = "0"
 	}
 
-	resp, err := d.client115.RapidUpload(fileSize, fileName, dirID, preHash, sha1Str, rs)
+	resp, err := d.client115.RapidUpload(fileSize, fileName, dirID, preHash, sha1Str,
+		&urlReadSeeker{url: downloadURL, size: fileSize},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("rapid upload: %w", err)
 	}
-
 	ok, err := resp.Ok()
 	if err != nil {
 		return nil, fmt.Errorf("upload resp: %w", err)
@@ -202,17 +152,19 @@ func (d *AliShare115) uploadTo115(fileName, downloadURL, sha1Str string, fileSiz
 	if !ok {
 		return nil, fmt.Errorf("SHA1 not found on 115")
 	}
-
 	return &uploadResult{PickCode: resp.PickCode}, nil
 }
 
 func (d *AliShare115) get115DownloadURL(pickCode string) (string, error) {
-	ua := fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer)
-	info, err := d.client115.DownloadWithUA(pickCode, ua)
+	info, err := d.client115.DownloadWithUA(pickCode, fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer))
 	if err != nil {
 		return "", fmt.Errorf("115 download: %w", err)
 	}
 	return info.Url.Url, nil
+}
+
+type uploadResult struct {
+	PickCode string
 }
 
 // ── HTTP Range ReadSeeker ──────────────────────────────────────────────
@@ -221,7 +173,6 @@ type urlReadSeeker struct {
 	url    string
 	size   int64
 	offset int64
-	ctx    context.Context
 }
 
 func (u *urlReadSeeker) Read(p []byte) (int, error) {
@@ -240,7 +191,7 @@ func (u *urlReadSeeker) ReadAt(p []byte, off int64) (int, error) {
 	if end >= u.size {
 		end = u.size - 1
 	}
-	req, err := http.NewRequestWithContext(u.ctx, http.MethodGet, u.url, nil)
+	req, err := http.NewRequest(http.MethodGet, u.url, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -261,22 +212,22 @@ func (u *urlReadSeeker) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (u *urlReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	var newOffset int64
+	var n int64
 	switch whence {
 	case io.SeekStart:
-		newOffset = offset
+		n = offset
 	case io.SeekCurrent:
-		newOffset = u.offset + offset
+		n = u.offset + offset
 	case io.SeekEnd:
-		newOffset = u.size + offset
+		n = u.size + offset
 	default:
 		return 0, fmt.Errorf("invalid whence")
 	}
-	if newOffset < 0 {
+	if n < 0 {
 		return 0, fmt.Errorf("negative seek")
 	}
-	u.offset = newOffset
-	return u.offset, nil
+	u.offset = n
+	return n, nil
 }
 
 func min64(a, b int64) int64 {
@@ -293,7 +244,7 @@ func computePreHash(downloadURL string, fileSize int64) (string, error) {
 	if fileSize < hashSize {
 		hashSize = fileSize
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, downloadURL, nil)
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -326,7 +277,7 @@ func fetch115AppVer() string {
 		Data  data   `json:"data"`
 	}
 	var r resp
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, driver115.ApiGetVersion, nil)
+	req, err := http.NewRequest(http.MethodGet, driver115.ApiGetVersion, nil)
 	if err != nil {
 		return defaultAppVer
 	}
