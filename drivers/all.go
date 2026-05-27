@@ -13,6 +13,7 @@ import (
 	_ "github.com/alist-org/alist/v3/drivers/pikpak_share"
 	_ "github.com/alist-org/alist/v3/drivers/webdav"
 	_ "github.com/alist-org/alist/v3/drivers/url_tree"
+	_ "github.com/alist-org/alist/v3/drivers/alishare_115"
 	_ "github.com/alist-org/alist/v3/drivers/strm_list"
 )
 
