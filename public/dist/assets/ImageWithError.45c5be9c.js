@@ -1,0 +1,1 @@
+import{t as n,v as e,az as o,W as s,F as c}from"./index.e234f7b7.js";const l=r=>{const[t,a]=n(!1);return e(c,{get when(){return!t()},get fallback(){return r.fallbackErr},get children(){return e(o,s(r,{onError:()=>{a(!0)}}))}})};export{l as I};

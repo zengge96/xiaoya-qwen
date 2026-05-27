@@ -1,0 +1,2 @@
+import{v as r,ap as s,o,bw as d}from"./index.e234f7b7.js";import{J as i,K as c}from"./Layout.5551a901.js";import"./useTitle.3ba9177a.js";const p=()=>{const[t]=i(),a=e=>o.obj.name.endsWith(".md")?e:"```"+d(o.obj.name)+`
+`+e+"\n```";return r(s,{get loading(){return t.loading},get children(){return r(c,{get children(){var e,n;return a((n=(e=t())==null?void 0:e.content)!=null?n:"")}})}})};export{p as default};

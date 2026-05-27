@@ -1,0 +1,187 @@
+name: Test Build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - os: linux
+            arch: amd64
+            musl: true
+            ext: ""
+          - os: linux
+            arch: arm64
+            musl: true
+            ext: ""
+          - os: linux
+            arch: arm
+            musl: true
+            ext: ""
+          - os: darwin
+            arch: amd64
+            musl: false
+            ext: ""
+          - os: darwin
+            arch: arm64
+            musl: false
+            ext: ""
+          - os: windows
+            arch: amd64
+            musl: false
+            ext: ".exe"
+          - os: windows
+            arch: arm64
+            musl: false
+            ext: ".exe"
+          - os: android
+            arch: arm64
+            musl: false
+            ext: ""
+
+    name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Setup musl cross-compiler
+        if: matrix.target.musl == true
+        run: |
+          BASE="https://musl.nn.ci/"
+          case "${{ matrix.target.arch }}" in
+            amd64) FILES=(x86_64-linux-musl-cross) ;;
+            arm64) FILES=(aarch64-linux-musl-cross) ;;
+            arm)   FILES=(arm-linux-musleabihf-cross) ;;
+          esac
+          for f in "${FILES[@]}"; do
+            if [ ! -e "${f}.tgz" ]; then
+              curl -L -o "${f}.tgz" "${BASE}${f}.tgz"
+              sudo tar xf "${f}.tgz" --strip-components=1 -C /usr/local
+              echo "Installed $f"
+            fi
+          done
+          ls /usr/local/bin/*musl* 2>/dev/null || echo "No musl gcc found"
+
+      - name: Setup Android NDK
+        if: matrix.target.os == 'android'
+        run: |
+          echo "Setting up Android NDK for ${{ matrix.target.arch }}"
+          ANDROID_NDK_VERSION="r29"
+          ANDROID_NDK_HOME="$RUNNER_TEMP/android-ndk-$ANDROID_NDK_VERSION"
+          if [ ! -d "$ANDROID_NDK_HOME" ]; then
+            curl -sL -o /tmp/android-ndk.zip "https://dl.google.com/android/repository/android-ndk-$ANDROID_NDK_VERSION-linux.zip"
+            unzip -q /tmp/android-ndk.zip -d "$RUNNER_TEMP"
+          fi
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "NDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.arch }}
+        run: |
+          # Write build script to temp file to avoid shell quoting issues
+          cat > /tmp/build_xiaoya.sh << 'SCRIPT_END'
+          set -e
+
+          builtAt="$(date +'%F %T %z')"
+          gitCommit=$(git log --pretty=format:"%h" -1)
+
+          if [ "$OS" = "android" ]; then
+            # Android: use NDK clang for correct bionic dependencies
+            export CGO_ENABLED=1
+            export GOOS=android
+            export GOARCH=arm64
+            TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            export CC="$TOOLCHAIN/bin/aarch64-linux-android21-clang"
+            export CXX="$TOOLCHAIN/bin/aarch64-linux-android21-clang++"
+            export CGO_CFLAGS="--target=aarch64-linux-android21 --sysroot=$TOOLCHAIN/sysroot"
+            export CGO_LDFLAGS="--target=aarch64-linux-android21 --sysroot=$TOOLCHAIN/sysroot"
+            LDFLAGS="-w -s \
+              -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=${builtAt}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=${gitCommit}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.Version=dev'"
+            echo "Building Android with CGO_ENABLED=1 + NDK"
+          elif [ "$MUSL" = "1" ]; then
+            # Linux musl: static binary
+            export CGO_ENABLED=1
+            case "$ARCH" in
+              amd64) export CC=/usr/local/bin/x86_64-linux-musl-gcc ;;
+              arm64) export CC=/usr/local/bin/aarch64-linux-musl-gcc ;;
+              arm)   export CC=/usr/local/bin/arm-linux-musleabihf-gcc ;;
+            esac
+            echo "Using CC=$CC"
+            LDFLAGS="-linkmode external -extldflags '-static -fpic' -w -s \
+              -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=${builtAt}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=${gitCommit}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.Version=dev'"
+          else
+            # Default: CGO disabled
+            export CGO_ENABLED=0
+            LDFLAGS="-w -s \
+              -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=${builtAt}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=${gitCommit}' \
+              -X 'github.com/alist-org/alist/v3/internal/conf.Version=dev'"
+          fi
+
+          output="alist-${OS}-${ARCH}${EXT}"
+          echo "Building for $OS/$ARCH (CGO=$CGO_ENABLED) -> $output"
+
+          mkdir -p build
+          go build -o "build/$output" -ldflags "$LDFLAGS" -tags=jsoniter .
+          ls -lh "build/$output"
+          SCRIPT_END
+
+          # Execute the script with all env vars
+          MUSL="${{ matrix.target.musl && '1' || '0' }}" \
+          OS="${{ matrix.target.os }}" \
+          ARCH="${{ matrix.target.arch }}" \
+          EXT="${{ matrix.target.ext }}" \
+          bash /tmp/build_xiaoya.sh
+
+      - name: Verify static binary (musl)
+        if: matrix.target.musl == true
+        run: |
+          f="build/alist-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}"
+          if readelf -l "$f" 2>/dev/null | grep -q "Requesting program interpreter"; then
+            echo "WARNING: Dynamic binary"
+          else
+            echo "Static binary verified."
+          fi
+
+      - name: Verify Android binary
+        if: matrix.target.os == 'android'
+        run: |
+          f="build/alist-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}"
+          echo "Checking Android binary dependencies:"
+          readelf -d "$f" | grep NEEDED
+          # Verify it uses Android bionic, not Linux glibc
+          if readelf -d "$f" | grep -q "libc.so.6"; then
+            echo "ERROR: Binary depends on Linux glibc (libc.so.6) instead of Android bionic"
+            exit 1
+          fi
+          if readelf -d "$f" | grep -q "liblog.so"; then
+            echo "SUCCESS: Binary correctly depends on Android bionic libraries"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist_${{ matrix.target.os }}_${{ matrix.target.arch }}
+          path: build/alist-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}
+          compression-level: 0
+          if-no-files-found: error

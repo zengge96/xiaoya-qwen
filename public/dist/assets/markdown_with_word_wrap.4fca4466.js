@@ -1,0 +1,2 @@
+import{v as n,ap as s,o,bw as d}from"./index.e234f7b7.js";import{J as i,K as c}from"./Layout.5551a901.js";import"./useTitle.3ba9177a.js";const g=()=>{const[r]=i(),a=e=>o.obj.name.endsWith(".md")?e:"```"+d(o.obj.name)+`
+`+e+"\n```";return n(s,{get loading(){return r.loading},get children(){return n(c,{class:"word-wrap",get children(){var e,t;return a((t=(e=r())==null?void 0:e.content)!=null?t:"")}})}})};export{g as default};
