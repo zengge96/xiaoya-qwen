@@ -2,17 +2,18 @@ package alishare_115
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/drivers/aliyundrive_share2open"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/pkg/cron"
-	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/go-resty/resty/v2"
 	driver115 "github.com/xiaoyaliu00/115driver/pkg/driver"
 )
 
@@ -20,24 +21,15 @@ type AliShare115 struct {
 	model.Storage
 	Addition
 
-	// Aliyun auth
-	AccessToken     string
-	ShareToken      string
-	AccessTokenOpen string
-	MyAliDriveId    string
+	// Delegated Aliyun driver
+	ali *aliyundrive_share2open.AliyundriveShare2Open
 
-	// 115 client
+	// 115
 	client115 *driver115.Pan115Client
 	appVer    string
-
-	// Caches
-	CopyFiles   map[string]string // share file_id -> own drive file_id
-	FileID_Link map[string]string // own drive file_id -> final URL
-	Hash_dict   map[string]string // share file_id -> SHA1
-
-	cron1 *cron.Cron
-	base  string
 }
+
+// ── Driver interface ───────────────────────────────────────────────────
 
 func (d *AliShare115) Config() driver.Config {
 	return config
@@ -48,165 +40,92 @@ func (d *AliShare115) GetAddition() driver.Additional {
 }
 
 func (d *AliShare115) Init(ctx context.Context) error {
-	if d.base == "" {
-		d.base = "https://openapi.alipan.com"
+	// Create delegated Aliyun driver
+	d.ali = &aliyundrive_share2open.AliyundriveShare2Open{}
+	d.ali.Storage = d.Storage
+	d.ali.Addition = aliyundrive_share2open.Addition{
+		RefreshToken:         d.RefreshToken,
+		RefreshTokenOpen:     d.RefreshTokenOpen,
+		TempTransferFolderID: d.TempTransferFolderID,
+		ShareId:              d.ShareId,
+		SharePwd:             d.SharePwd,
+		OrderBy:              d.OrderBy,
+		OrderDirection:       d.OrderDirection,
+		OauthTokenURL:        d.OauthTokenURL,
+		ClientID:             d.ClientID,
+		ClientSecret:         d.ClientSecret,
 	}
-	// Placeholder — real auth happens lazily in Link/List
-	d.AccessToken = "fake_token_for_fast_init"
-	d.ShareToken = "fake_share_token"
-	d.AccessTokenOpen = "fake_open_token"
+	d.ali.Addition.RootID.RootFolderID = d.Addition.RootID.RootFolderID
+	if err := d.ali.Init(ctx); err != nil {
+		return fmt.Errorf("aliyun init: %w", err)
+	}
 
-	d.CopyFiles = make(map[string]string)
-	d.FileID_Link = make(map[string]string)
-	d.Hash_dict = make(map[string]string)
-
-	// 115 client from cookie
+	// Init 115 client
 	if err := d.init115Client(); err != nil {
 		return fmt.Errorf("115 init: %w", err)
 	}
-
-	// Periodic cache cleanup (every 3 min)
-	d.cron1 = cron.NewCron(time.Minute * 3)
-	d.cron1.Do(func() {
-		if len(d.FileID_Link) == 0 {
-			return
-		}
-		d.FileID_Link = make(map[string]string)
-		d.Hash_dict = make(map[string]string)
-		d.CopyFiles = make(map[string]string)
-	})
-
 	return nil
 }
 
 func (d *AliShare115) Drop(ctx context.Context) error {
-	if d.cron1 != nil {
-		d.cron1.Stop()
+	if d.ali != nil {
+		d.ali.Drop(ctx)
 	}
-	d.MyAliDriveId = ""
 	return nil
 }
 
-// ── List ────────────────────────────────────────────────────────────────
-
 func (d *AliShare115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	if err := d.ensureValidToken(ctx); err != nil {
-		return nil, err
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= 3; attempt++ {
-		files, err := d.getFiles(dir.GetID())
-		if err == nil {
-			return utils.SliceConvert(files, func(src File) (model.Obj, error) {
-				return fileToObj(src), nil
-			})
-		}
-		lastErr = err
-		time.Sleep(2 * time.Second)
-	}
-	return nil, fmt.Errorf("list failed: %w", lastErr)
+	return d.ali.List(ctx, dir, args)
 }
 
-// ── Link ────────────────────────────────────────────────────────────────
-
 func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if err := d.ensureValidToken(ctx); err != nil {
-		return nil, err
-	}
-
-	fileID := file.GetID()
-	fileName := file.GetName()
-
-	// 1. Cache hit — already on 115
-	if cachedURL, ok := d.FileID_Link[fileID]; ok {
-		return d.makeLink(cachedURL), nil
-	}
-
-	// 2. Copy share file → own Aliyun drive (required for Open API access)
-	newFileID, err := d.copyToMyDrive(ctx, fileID, fileName)
-	if err != nil {
+	// 1. Copy from share to own drive
+	newFileID, err := d.ali.Copy2Myali(ctx, d.ali.MyAliDriveId, file.GetID(), file.GetName())
+	if err != nil || newFileID == "" {
 		return d.fallbackLink()
 	}
 
 	time.Sleep(2 * time.Second)
 
-	// 3. Get download URL + SHA1 from own drive
-	info, err := d.getOpenDownloadInfo(newFileID, fileID, fileName)
-	if err != nil {
+	// 2. Get Aliyun download URL + SHA1
+	downloadURL, err := d.ali.GetmyLink(ctx, newFileID, file.GetID(), file.GetName())
+	if err != nil && downloadURL == "" {
 		return d.fallbackLink()
 	}
 
-	// 4. Rapid upload to 115
-	result, err := d.uploadTo115(fileName, info.URL, info.SHA1, info.Size)
-	if err != nil {
-		// Fallback: return Aliyun URL directly
-		d.FileID_Link[fileID] = info.URL
-		return d.makeLink(info.URL), nil
+	// 3. Try 115 rapid upload
+	sha1Str := d.ali.Hash_dict[file.GetID()]
+	if sha1Str != "" {
+		if result, err := d.uploadTo115(file.GetName(), downloadURL, sha1Str, file.GetSize()); err == nil {
+			if url115, err := d.get115DownloadURL(result.PickCode); err == nil && !strings.Contains(url115, "abnormal.png") {
+				return d.makeLink(url115), nil
+			}
+		}
 	}
 
-	// 5. Get 115 download URL
-	downloadURL, err := d.get115DownloadURL(result.PickCode)
-	if err != nil {
-		return d.fallbackLink()
-	}
-
-	// 6. Cache & return
-	if !strings.Contains(downloadURL, "abnormal.png") {
-		d.FileID_Link[fileID] = downloadURL
-	}
-
+	// 4. Fallback: return Aliyun URL
 	return d.makeLink(downloadURL), nil
 }
 
-// ── Other (video preview) ──────────────────────────────────────────────
-
 func (d *AliShare115) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
-	var resp base.Json
-	var uri string
-
-	newFileID, _ := d.copyToMyDrive(ctx, args.Obj.GetID(), args.Obj.GetName())
-	data := base.Json{
-		"drive_id": d.MyAliDriveId,
-		"share_id": d.ShareId,
-		"file_id":  newFileID,
-	}
-	switch args.Method {
-	case "video_preview":
-		uri = "/adrive/v1.0/openFile/getVideoPreviewPlayInfo"
-		data["category"] = "live_transcoding"
-		data["url_expire_sec"] = 14400
-	default:
-		return nil, fmt.Errorf("unsupported method: %s", args.Method)
-	}
-	_, err := d.requestOpen(uri, http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data).SetResult(&resp)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
+	return d.ali.Other(ctx, args)
 }
 
-// ── Hash ────────────────────────────────────────────────────────────────
-
 func (d *AliShare115) GetHash(ctx context.Context, file model.Obj, args model.LinkArgs) string {
-	if d.Hash_dict == nil {
-		return ""
+	if d.ali.Hash_dict != nil {
+		if hash, ok := d.ali.Hash_dict[file.GetID()]; ok {
+			return hash
+		}
 	}
-	if hash, ok := d.Hash_dict[file.GetID()]; ok {
-		return hash
-	}
-	// Trigger Link to populate cache
 	if _, err := d.Link(ctx, file, args); err == nil {
-		if hash, ok := d.Hash_dict[file.GetID()]; ok {
+		if hash, ok := d.ali.Hash_dict[file.GetID()]; ok {
 			return hash
 		}
 	}
 	return ""
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
+// ── Link helpers ───────────────────────────────────────────────────────
 
 func (d *AliShare115) makeLink(url string) *model.Link {
 	return &model.Link{
@@ -219,6 +138,208 @@ func (d *AliShare115) makeLink(url string) *model.Link {
 
 func (d *AliShare115) fallbackLink() (*model.Link, error) {
 	return d.makeLink("http://img.xiaoya.pro/abnormal.png"), nil
+}
+
+// ── 115 client ─────────────────────────────────────────────────────────
+
+func (d *AliShare115) init115Client() error {
+	d.appVer = fetch115AppVer()
+	opts := []driver115.Option{
+		driver115.UA(fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer)),
+	}
+	client := driver115.New(opts...)
+
+	cr := &driver115.Credential{}
+	if err := cr.FromCookie(d.Cookie115); err != nil {
+		return fmt.Errorf("115 cookie: %w", err)
+	}
+	client.ImportCredential(cr)
+
+	if err := client.LoginCheck(); err != nil {
+		return fmt.Errorf("115 login: %w", err)
+	}
+
+	d.client115 = client
+	return nil
+}
+
+// ── 115 rapid upload ───────────────────────────────────────────────────
+
+type uploadResult struct {
+	PickCode string
+}
+
+func (d *AliShare115) uploadTo115(fileName, downloadURL, sha1Str string, fileSize int64) (*uploadResult, error) {
+	if sha1Str == "" {
+		return nil, fmt.Errorf("SHA1 required")
+	}
+
+	preHash, err := computePreHash(downloadURL, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("pre-hash: %w", err)
+	}
+
+	rs := &urlReadSeeker{
+		url:  downloadURL,
+		size: fileSize,
+		ctx:  context.Background(),
+	}
+
+	dirID := d.TargetFolder115
+	if dirID == "" {
+		dirID = "0"
+	}
+
+	resp, err := d.client115.RapidUpload(fileSize, fileName, dirID, preHash, sha1Str, rs)
+	if err != nil {
+		return nil, fmt.Errorf("rapid upload: %w", err)
+	}
+
+	ok, err := resp.Ok()
+	if err != nil {
+		return nil, fmt.Errorf("upload resp: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("SHA1 not found on 115")
+	}
+
+	return &uploadResult{PickCode: resp.PickCode}, nil
+}
+
+func (d *AliShare115) get115DownloadURL(pickCode string) (string, error) {
+	ua := fmt.Sprintf("Mozilla/5.0 115Browser/%s", d.appVer)
+	info, err := d.client115.DownloadWithUA(pickCode, ua)
+	if err != nil {
+		return "", fmt.Errorf("115 download: %w", err)
+	}
+	return info.Url.Url, nil
+}
+
+// ── HTTP Range ReadSeeker ──────────────────────────────────────────────
+
+type urlReadSeeker struct {
+	url    string
+	size   int64
+	offset int64
+	ctx    context.Context
+}
+
+func (u *urlReadSeeker) Read(p []byte) (int, error) {
+	n, err := u.ReadAt(p, u.offset)
+	if n > 0 {
+		u.offset += int64(n)
+	}
+	return n, err
+}
+
+func (u *urlReadSeeker) ReadAt(p []byte, off int64) (int, error) {
+	if off >= u.size {
+		return 0, io.EOF
+	}
+	end := off + int64(len(p)) - 1
+	if end >= u.size {
+		end = u.size - 1
+	}
+	req, err := http.NewRequestWithContext(u.ctx, http.MethodGet, u.url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("Range request: HTTP %d", resp.StatusCode)
+	}
+	n, err := io.ReadFull(resp.Body, p[:min64(int64(len(p)), end-off+1)])
+	if err == io.ErrUnexpectedEOF || err == io.EOF {
+		err = nil
+	}
+	return n, err
+}
+
+func (u *urlReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = u.offset + offset
+	case io.SeekEnd:
+		newOffset = u.size + offset
+	default:
+		return 0, fmt.Errorf("invalid whence")
+	}
+	if newOffset < 0 {
+		return 0, fmt.Errorf("negative seek")
+	}
+	u.offset = newOffset
+	return u.offset, nil
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ── SHA1 pre-hash ──────────────────────────────────────────────────────
+
+func computePreHash(downloadURL string, fileSize int64) (string, error) {
+	hashSize := int64(128 * 1024)
+	if fileSize < hashSize {
+		hashSize = fileSize
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", hashSize-1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	h := sha1.New()
+	if _, err := io.Copy(h, resp.Body); err != nil {
+		return "", err
+	}
+	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
+}
+
+// ── 115 app version ────────────────────────────────────────────────────
+
+var defaultAppVer = "35.6.0.3"
+
+func fetch115AppVer() string {
+	type win struct {
+		Version string `json:"version_code"`
+	}
+	type data struct {
+		Win win `json:"win"`
+	}
+	type resp struct {
+		Error string `json:"error,omitempty"`
+		Data  data   `json:"data"`
+	}
+	var r resp
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, driver115.ApiGetVersion, nil)
+	if err != nil {
+		return defaultAppVer
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return defaultAppVer
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if err := json.Unmarshal(body, &r); err != nil || r.Error != "" || r.Data.Win.Version == "" {
+		return defaultAppVer
+	}
+	return r.Data.Win.Version
 }
 
 // Interface check

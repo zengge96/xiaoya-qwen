@@ -86,24 +86,24 @@ func (d *AliyundriveShare2Open) Init(ctx context.Context) error {
 	return nil
 }
 
-func (d *AliyundriveShare2Open) ensureValidToken(ctx context.Context) error {
+func (d *AliyundriveShare2Open) EnsureValidToken(ctx context.Context) error {
     if d.AccessToken == "fake_token_for_fast_init" {
-        if err := d.refreshToken(); err != nil {
+        if err := d.DoRefreshToken(); err != nil {
             d.AccessToken = "fake_token_for_fast_init"
             return err
         }
-        if err := d.getShareToken(); err != nil {
+        if err := d.DoGetShareToken(); err != nil {
             d.AccessToken = "fake_token_for_fast_init"
             return err
         }
-        if err := d.refreshTokenOpen(); err != nil {
+        if err := d.DoRefreshTokenOpen(); err != nil {
             d.AccessToken = "fake_token_for_fast_init"
             return err
         }
     }
    
     if d.MyAliDriveId == "" {
-        res, err := d.requestOpen("/adrive/v1.0/user/getDriveInfo", http.MethodPost, func(req *resty.Request){})
+        res, err := d.RequestOpen("/adrive/v1.0/user/getDriveInfo", http.MethodPost, func(req *resty.Request){})
         if err != nil {
             return err
         }
@@ -125,13 +125,13 @@ func (d *AliyundriveShare2Open) Drop(ctx context.Context) error {
 }
 
 func (d *AliyundriveShare2Open) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-    if err := d.ensureValidToken(ctx); err != nil {
+    if err := d.EnsureValidToken(ctx); err != nil {
         return nil, err
     }
 
     count := 0
 	for {
-		files, err := d.getFiles(dir.GetID())
+		files, err := d.GetFiles(dir.GetID())
 		if err != nil {
 			if count > conf.Conf.Retry_count {
 				fmt.Println("获取目录列表失败，结束重试",d.MountPath,": ",dir.GetName())
@@ -151,7 +151,7 @@ func (d *AliyundriveShare2Open) List(ctx context.Context, dir model.Obj, args mo
 }
 
 func (d *AliyundriveShare2Open) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-    if err := d.ensureValidToken(ctx); err != nil {
+    if err := d.EnsureValidToken(ctx); err != nil {
         return nil, err
     }
 
@@ -223,7 +223,7 @@ func (d *AliyundriveShare2Open) Copy2Myali(ctx context.Context, src_driveid stri
 				},
 			},},
 	}
-	r, err := d.request(targetUrl, http.MethodPost, func(req *resty.Request) {
+	r, err := d.Request(targetUrl, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(jsonData)
 	})
 	if err != nil {
@@ -249,7 +249,7 @@ func (d *AliyundriveShare2Open) Copy2Myali(ctx context.Context, src_driveid stri
 			fmt.Println(time.Now().Format("01-02-2006 15:04:05"),"新增转存记录, file_id(x): ",NNewfile_id," 文件: ",file_name)	
 		}
 		if NNewfile_id == "" {
-            r, err := d.request(targetUrl, http.MethodPost, func(req *resty.Request) {req.SetBody(jsonData)})
+            r, err := d.Request(targetUrl, http.MethodPost, func(req *resty.Request) {req.SetBody(jsonData)})
             if err != nil {
                 fmt.Println("转存失败: ",string(r),err)
                 return "", err
@@ -282,7 +282,7 @@ func (d *AliyundriveShare2Open) GetmyLink(ctx context.Context, file_id, old_file
 
     count := 1
     for {
-        res, err := d.requestOpen("/adrive/v1.0/openFile/getDownloadUrl", http.MethodPost, func(req *resty.Request) {
+        res, err := d.RequestOpen("/adrive/v1.0/openFile/getDownloadUrl", http.MethodPost, func(req *resty.Request) {
             req.SetBody(base.Json{
                 "drive_id":   d.MyAliDriveId,
                 "file_id":    file_id,
@@ -328,7 +328,7 @@ func (d *AliyundriveShare2Open) GetmyLink(ctx context.Context, file_id, old_file
 }
 
 func (d *AliyundriveShare2Open) Remove(ctx context.Context, file_id string) error {
-	_, err := d.requestOpen("/adrive/v1.0/openFile/delete", http.MethodPost, func(req *resty.Request) {
+	_, err := d.RequestOpen("/adrive/v1.0/openFile/delete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"file_id": file_id,
 			"drive_id":  d.MyAliDriveId,
@@ -338,7 +338,7 @@ func (d *AliyundriveShare2Open) Remove(ctx context.Context, file_id string) erro
 }
 
 func (d *AliyundriveShare2Open) Purge_temp_folder(ctx context.Context) error {
-	res, err := d.requestOpen("/adrive/v1.0/openFile/list", http.MethodPost, func(req *resty.Request) {
+	res, err := d.RequestOpen("/adrive/v1.0/openFile/list", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"parent_file_id": d.TempTransferFolderID,
 			"drive_id":  d.MyAliDriveId,
@@ -380,7 +380,7 @@ func (d *AliyundriveShare2Open) Other(ctx context.Context, args model.OtherArgs)
 	default:
 		return nil, errs.NotSupport
 	}
-	_, err := d.requestOpen(uri, http.MethodPost, func(req *resty.Request) {
+	_, err := d.RequestOpen(uri, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data).SetResult(&resp)
 	})
 	if err != nil {

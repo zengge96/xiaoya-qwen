@@ -11,10 +11,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func (d *AliyundriveShare2Open) refreshToken() error {
+func (d *AliyundriveShare2Open) DoRefreshToken() error {
     if base.AccessToken != ""{
         d.RefreshToken, d.AccessToken = base.RefreshToken, base.AccessToken
-        //fmt.Println("AccessToken 已存在")
         return nil
     }
 
@@ -41,8 +40,7 @@ func (d *AliyundriveShare2Open) refreshToken() error {
 	return nil
 }
 
-// do others that not defined in Driver interface
-func (d *AliyundriveShare2Open) getShareToken() error {
+func (d *AliyundriveShare2Open) DoGetShareToken() error {
 	data := base.Json{
 		"share_id": d.ShareId,
 	}
@@ -64,7 +62,7 @@ func (d *AliyundriveShare2Open) getShareToken() error {
 	return nil
 }
 
-func (d *AliyundriveShare2Open) request(url, method string, callback base.ReqCallback) ([]byte, error) {
+func (d *AliyundriveShare2Open) Request(url, method string, callback base.ReqCallback) ([]byte, error) {
         var e ErrorResp
         req := base.RestyClient.R().
                 SetError(&e).
@@ -85,14 +83,14 @@ func (d *AliyundriveShare2Open) request(url, method string, callback base.ReqCal
                 if utils.SliceContains([]string{"AccessTokenInvalid", "AccessTokenExpired", "I400JD"}, e.Code) || e.Code == "ShareLinkTokenInvalid" {
                         if  utils.SliceContains([]string{"AccessTokenInvalid", "AccessTokenExpired", "I400JD"}, e.Code) {
 								base.AccessToken = ""
-                                err = d.refreshToken()
+                                err = d.DoRefreshToken()
                         } else {
-                                err = d.getShareToken()
+                                err = d.DoGetShareToken()
                         }
                         if err != nil {
                                 return nil, err
                         }
-                        return d.request(url, method, callback)
+                        return d.Request(url, method, callback)
                 } else {
                         return nil, errors.New(e.Code + ": " + e.Message)
                 }
@@ -100,13 +98,11 @@ func (d *AliyundriveShare2Open) request(url, method string, callback base.ReqCal
         return resp.Body(), nil
 }
 
-func (d *AliyundriveShare2Open) getFiles(fileId string) ([]File, error) {
-    // 1. 初始容量预设（第一页 200 条）
+func (d *AliyundriveShare2Open) GetFiles(fileId string) ([]File, error) {
     files := make([]File, 0, 200)
     var marker string
 
     for {
-        // 2. 构造请求体，避免使用 "first" 这种魔术字符串
         data := map[string]interface{}{
             "limit":           200,
             "order_by":        d.OrderBy,
@@ -119,7 +115,6 @@ func (d *AliyundriveShare2Open) getFiles(fileId string) ([]File, error) {
         var e ErrorResp
         var resp ListResp
 
-        // 3. 执行请求（注意：此处使用了读锁保护 ShareToken）
         res, err := base.RestyClient.R().
             SetHeader("x-share-token", d.ShareToken).
             SetResult(&resp).
@@ -132,38 +127,32 @@ func (d *AliyundriveShare2Open) getFiles(fileId string) ([]File, error) {
         }
         log.Debugf("aliyundrive share get files: %s", res.String())
 
-        // 4. Token 失效处理与并发优化
         if e.Code != "" {
             if (utils.SliceContains([]string{"AccessTokenInvalid","AccessTokenExpired","I400JD"},e.Code) || e.Code == "ShareLinkTokenInvalid") {
-                err = d.getShareToken()
+                err = d.DoGetShareToken()
                 if err != nil {
                     return nil, err
                 }
-                return d.getFiles(fileId) 
+                return d.GetFiles(fileId) 
             }
             return nil, errors.New(e.Message)
         }
 
-        // 5. 核心内存优化：第一页拿到后发现还有后续，直接扩容容器
         if resp.NextMarker != "" && len(files) == 0 {
-            // 预估大目录容量，避免后续多次扩容带来的 CPU 拷贝消耗
             newFiles := make([]File, 0, 2000)
             files = newFiles
         }
 
-        // 合并数据
         if len(resp.Items) > 0 {
             files = append(files, resp.Items...)
         }
 
-        // 6. 翻页控制
         marker = resp.NextMarker
         if marker == "" {
             break
         }
     }
 
-    // 7. 辅助信息更新
     if len(files) > 0 && d.MyAliDriveId == "" {
         d.MyAliDriveId = files[0].DriveId
     }
@@ -171,11 +160,9 @@ func (d *AliyundriveShare2Open) getFiles(fileId string) ([]File, error) {
     return files, nil
 }
 
-func (d *AliyundriveShare2Open) refreshTokenOpen() error {
-
+func (d *AliyundriveShare2Open) DoRefreshTokenOpen() error {
     if base.AliOpenAccessToken != ""{
         d.RefreshTokenOpen, d.AccessTokenOpen = base.AliOpenRefreshToken, base.AliOpenAccessToken
-        //fmt.Println("AliOpenAccessToken 已存在")
         return nil
     }
     url :=  "https://openapi.alipan.com/oauth/access_token"
@@ -187,7 +174,7 @@ func (d *AliyundriveShare2Open) refreshTokenOpen() error {
         url = d.OauthTokenURL
 	}
 
-		_, err := base.RestyClient.R().
+	_, err := base.RestyClient.R().
         ForceContentType("application/json").
         SetBody(base.Json{
             "client_id":     d.ClientID,
@@ -213,11 +200,8 @@ func (d *AliyundriveShare2Open) refreshTokenOpen() error {
     return nil
 }
 
-func (d *AliyundriveShare2Open) requestOpen(uri, method string, callback base.ReqCallback, retry ...bool) ([]byte, error) {
-
-	// fmt.Println("AccessTokenOpen:\n",d.AccessTokenOpen,"\nAliOpenAccessToken:\n", base.AliOpenAccessToken )
+func (d *AliyundriveShare2Open) RequestOpen(uri, method string, callback base.ReqCallback, retry ...bool) ([]byte, error) {
 	req := base.RestyClient.R()
-	// TODO check whether access_token is expired
 	req.SetHeader("Authorization", "Bearer "+d.AccessTokenOpen)
 	if method == http.MethodPost {
 		req.SetHeader("Content-Type", "application/json")
@@ -235,11 +219,11 @@ func (d *AliyundriveShare2Open) requestOpen(uri, method string, callback base.Re
 	if e.Code != "" {
 		if !isRetry && utils.SliceContains([]string{"AccessTokenInvalid", "AccessTokenExpired", "I400JD"}, e.Code) {
 			base.AliOpenAccessToken = ""
-			err = d.refreshTokenOpen()
+			err = d.DoRefreshTokenOpen()
 			if err != nil {
 				return nil, err
 			}
-			return d.requestOpen(uri, method, callback, true)
+			return d.RequestOpen(uri, method, callback, true)
 		}
 		return nil, fmt.Errorf("%s:%s", e.Code, e.Message)
 	}
@@ -247,7 +231,6 @@ func (d *AliyundriveShare2Open) requestOpen(uri, method string, callback base.Re
 }
 
 func (d *AliyundriveShare2Open) requestOpenCDN(url, method string, callback base.ReqCallback, retry ...bool) ([]byte, error) {
-
     req := base.RestyClient.R()
     req.SetHeader("Authorization", "Bearer "+d.AccessToken)
     if method == http.MethodPost {
@@ -266,7 +249,7 @@ func (d *AliyundriveShare2Open) requestOpenCDN(url, method string, callback base
     if e.Code != "" {
         if !isRetry && utils.SliceContains([]string{"AccessTokenInvalid", "AccessTokenExpired", "I400JD"}, e.Code) {
             base.AliOpenAccessToken = ""
-            err = d.refreshTokenOpen()
+            err = d.DoRefreshTokenOpen()
             if err != nil {
                 return nil, err
             }
