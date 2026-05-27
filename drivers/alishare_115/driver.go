@@ -2,15 +2,16 @@ package alishare_115
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/alist-org/alist/v3/drivers/aliyundrive_share2open"
 	"github.com/alist-org/alist/v3/drivers/official_115"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/op"
-
+	driver115 "github.com/xiaoyaliu00/115driver/pkg/driver"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -18,11 +19,11 @@ type AliShare115 struct {
 	model.Storage
 	Addition
 
-	// 复用的阿里云盘分享驱动
 	aliShare *aliyundrive_share2open.AliyundriveShare2Open
+	pan115   *official_115.Pan115
 
 	// 115 直链缓存: file_id → 115 download URL
-	cMu  sync.RWMutex
+	cMu   sync.RWMutex
 	cache map[string]string
 }
 
@@ -35,12 +36,23 @@ func (d *AliShare115) GetAddition() driver.Additional {
 }
 
 func (d *AliShare115) Init(ctx context.Context) error {
-	// 复用 aliyundrive_share2open 的内部驱动处理 token / 列表 / 直链
+	// Init aliShare（处理 token / 列表 / 直链）
 	d.aliShare = &aliyundrive_share2open.AliyundriveShare2Open{}
-	d.aliShare.Addition = d.Addition.Addition // 字段完全相同，直接复制
-
+	d.aliShare.Addition = d.Addition.Addition
 	if err := d.aliShare.Init(ctx); err != nil {
 		return fmt.Errorf("aliShare init: %w", err)
+	}
+
+	// Init internal Pan115 client
+	official_115.InitAppVerOnce()
+	d.pan115 = &official_115.Pan115{}
+	if d.Cookie115 != "" {
+		client, err := newPan115Client(d.Cookie115)
+		if err != nil {
+			return fmt.Errorf("115 client: %w", err)
+		}
+		d.pan115.SetClient(client)
+		log.Infof("alishare_115: 115 client initialized")
 	}
 
 	d.cache = make(map[string]string)
@@ -82,9 +94,35 @@ func (d *AliShare115) Other(ctx context.Context, args model.OtherArgs) (interfac
 	return d.aliShare.Other(ctx, args)
 }
 
+// newPan115Client 从 cookie 创建已登录的 Pan115Client
+func newPan115Client(cookie string) (*driver115.Pan115Client, error) {
+	opts := []driver115.Option{
+		driver115.UA("Mozilla/5.0 115Browser/" + official_115.GetAppVer()),
+		driver115.WithClient(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}),
+	}
+	client := driver115.New(opts...)
+	cr := &driver115.Credential{}
+	if err := cr.FromCookie(cookie); err != nil {
+		return nil, fmt.Errorf("parse 115 cookie: %w", err)
+	}
+	client.ImportCredential(cr)
+	if err := client.LoginCheck(); err != nil {
+		return nil, fmt.Errorf("115 login check: %w", err)
+	}
+	return client, nil
+}
+
 // try115Link 尝试从 115 获取直链
 func (d *AliShare115) try115Link(ctx context.Context, file model.Obj, aliyunUrl, sha1Str string, args model.LinkArgs) (*model.Link, error) {
 	fileId := file.GetID()
+
+	if d.pan115 == nil || d.pan115.GetDriverClient() == nil {
+		return nil, fmt.Errorf("115 client not available")
+	}
 
 	// 缓存命中
 	d.cMu.RLock()
@@ -93,12 +131,6 @@ func (d *AliShare115) try115Link(ctx context.Context, file model.Obj, aliyunUrl,
 		return &model.Link{URL: url}, nil
 	}
 	d.cMu.RUnlock()
-
-	// 查找已配置的 official_115
-	pan115 := d.findOfficial115()
-	if pan115 == nil {
-		return nil, fmt.Errorf("no official_115 storage found")
-	}
 
 	// 空 hash 无法秒传
 	if sha1Str == "" {
@@ -111,13 +143,13 @@ func (d *AliShare115) try115Link(ctx context.Context, file model.Obj, aliyunUrl,
 	dstDir := &model.Object{ID: d.TargetFolder115}
 
 	// 秒传到 115
-	obj, err := pan115.Put(ctx, dstDir, stream, nil)
+	obj, err := d.pan115.Put(ctx, dstDir, stream, nil)
 	if err != nil {
 		return nil, fmt.Errorf("115 Put: %w", err)
 	}
 
 	// 获取 115 直链
-	link, err := pan115.Link(ctx, obj, args)
+	link, err := d.pan115.Link(ctx, obj, args)
 	if err != nil {
 		return nil, fmt.Errorf("115 Link: %w", err)
 	}
@@ -129,16 +161,6 @@ func (d *AliShare115) try115Link(ctx context.Context, file model.Obj, aliyunUrl,
 
 	log.Infof("alishare_115: cached 115 link for %s", file.GetName())
 	return link, nil
-}
-
-// findOfficial115 在已加载的存储中查找第一个 official_115
-func (d *AliShare115) findOfficial115() *official_115.Pan115 {
-	for _, s := range op.GetAllStorages() {
-		if p, ok := s.(*official_115.Pan115); ok {
-			return p
-		}
-	}
-	return nil
 }
 
 // ============ 编译时接口检查 ============

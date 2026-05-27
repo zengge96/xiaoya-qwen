@@ -8,7 +8,8 @@ import (
 
 type Addition struct {
 	aliyundrive_share2open.Addition
-	TargetFolder115 string `json:"target_folder_115" default:"0" help:"115 目标文件夹 ID，用于保存转存的文件"`
+	Cookie115       string `json:"cookie115" type:"text" help:"115 cookie (UID=...;CID=...;SEID=...;KID=...)"`
+	TargetFolder115 string `json:"target_folder_115" default:"0" help:"115 目标文件夹 ID"`
 }
 
 var config = driver.Config{
