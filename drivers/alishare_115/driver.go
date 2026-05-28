@@ -3,7 +3,6 @@ package alishare_115
 import (
 	"context"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -12,19 +11,18 @@ import (
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/aliyundrive_share2open"
-	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/drivers/official_115"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/cron"
-	driver115 "github.com/xiaoyaliu00/115driver/pkg/driver"
 )
 
 type AliShare115 struct {
 	model.Storage
 	Addition
 	ali       *aliyundrive_share2open.AliyundriveShare2Open
-	client    *driver115.Pan115Client
-	cache115  map[string]string // file_id → 115 download URL
+	p115      *official_115.Pan115
+	cache115  map[string]string
 	cronCache *cron.Cron
 }
 
@@ -37,7 +35,7 @@ func (d *AliShare115) GetAddition() driver.Additional {
 }
 
 func (d *AliShare115) Init(ctx context.Context) error {
-	// 1. Create and init aliyundrive_share2open instance
+	// 1. Aliyun driver
 	d.ali = &aliyundrive_share2open.AliyundriveShare2Open{}
 	d.ali.Addition = aliyundrive_share2open.Addition{
 		RefreshToken:         d.RefreshToken,
@@ -50,19 +48,25 @@ func (d *AliShare115) Init(ctx context.Context) error {
 		OrderDirection:       d.OrderDirection,
 	}
 	if err := d.ali.Init(ctx); err != nil {
-		return fmt.Errorf("aliyun init failed: %w", err)
+		return fmt.Errorf("aliyun: %w", err)
 	}
 
-	// 2. Login to 115
-	if err := d.login115(); err != nil {
-		return fmt.Errorf("115 login failed: %w", err)
+	// 2. 115 driver
+	official_115.InitAppVerOnce()
+	d.p115 = &official_115.Pan115{
+		Addition: official_115.Addition{
+			Cookie: d.Cookie,
+		},
+	}
+	if err := d.p115.Init(ctx); err != nil {
+		return fmt.Errorf("115: %w", err)
 	}
 
-	// 3. Init 115 URL cache with periodic cleanup
+	// 3. Cache
 	d.cache115 = make(map[string]string)
 	d.cronCache = cron.NewCron(time.Minute * 3)
 	d.cronCache.Do(func() {
-		fmt.Printf("[alishare_115] clearing 115 URL cache (%s)\n", d.MountPath)
+		fmt.Printf("[alishare_115] clearing cache (%s)\n", d.MountPath)
 		d.cache115 = make(map[string]string)
 	})
 
@@ -72,6 +76,9 @@ func (d *AliShare115) Init(ctx context.Context) error {
 func (d *AliShare115) Drop(ctx context.Context) error {
 	if d.ali != nil {
 		d.ali.Drop(ctx)
+	}
+	if d.p115 != nil {
+		d.p115.Drop(ctx)
 	}
 	if d.cronCache != nil {
 		d.cronCache.Stop()
@@ -87,48 +94,41 @@ func (d *AliShare115) Link(ctx context.Context, file model.Obj, args model.LinkA
 	fileID := file.GetID()
 	fileName := file.GetName()
 
-	// 115 cache hit
 	if url, ok := d.cache115[fileID]; ok {
-		fmt.Printf("[alishare_115] 115 cache hit: %s\n", fileName)
+		fmt.Printf("[alishare_115] cache hit: %s\n", fileName)
 		return &model.Link{URL: url}, nil
 	}
 
-	// Get Aliyun link — this handles auth, copy, download URL, and SHA1 hash
-	// All results are stored in exported fields: FileID_Link[fileID] and Hash_dict[fileID]
+	// Full Aliyun flow: auth → copy → get download URL + SHA1
 	aliLink, err := d.ali.Link(ctx, file, args)
 	if err != nil {
 		return nil, err
 	}
 
-	// Read SHA1 from exported Hash_dict (populated by Link → GetmyLink)
-	sha1 := d.ali.Hash_dict[fileID]
-
-	// No SHA1 or abnormal link → return Aliyun link as-is
+	sha1Hash := d.ali.Hash_dict[fileID]
 	abnormal := "http://img.xiaoya.pro/abnormal.png"
-	if sha1 == "" || aliLink.URL == "" || aliLink.URL == abnormal {
+	if sha1Hash == "" || aliLink.URL == "" || aliLink.URL == abnormal {
 		return aliLink, nil
 	}
 
-	// Try SHA1 rapid upload to 115
+	// SHA1 rapid upload to 115
 	targetDir := d.TargetFolder115
 	if targetDir == "" {
 		targetDir = "0"
 	}
 
-	pickCode, err := d.sha1UploadTo115(ctx, file.GetSize(), fileName, sha1, aliLink.URL, targetDir)
+	pickCode, err := d.sha1Upload(ctx, file.GetSize(), fileName, sha1Hash, aliLink.URL, targetDir)
 	if err != nil {
-		fmt.Printf("[alishare_115] SHA1 upload failed for %s: %v, fallback to Aliyun\n", fileName, err)
+		fmt.Printf("[alishare_115] upload failed for %s: %v, fallback\n", fileName, err)
 		return aliLink, nil
 	}
 
-	// Get 115 download URL
-	dl, err := d.client.DownloadWithUA(pickCode, "")
+	dl, err := d.p115.GetDriverClient().DownloadWithUA(pickCode, "")
 	if err != nil {
-		fmt.Printf("[alishare_115] DownloadWithUA failed for %s: %v, fallback to Aliyun\n", fileName, err)
+		fmt.Printf("[alishare_115] DownloadWithUA failed: %v, fallback\n", err)
 		return aliLink, nil
 	}
 
-	// Cache and return 115 URL
 	d.cache115[fileID] = dl.Url.Url
 	fmt.Printf("[alishare_115] 115 link ready: %s\n", fileName)
 	return &model.Link{
@@ -141,134 +141,60 @@ func (d *AliShare115) Other(ctx context.Context, args model.OtherArgs) (interfac
 	return d.ali.Other(ctx, args)
 }
 
-// === 115 helpers ===
+// --- helpers ---
 
-func (d *AliShare115) login115() error {
-	opts := []driver115.Option{
-		driver115.UA(driver115.UA115Browser),
-		func(c *driver115.Pan115Client) {
-			c.Client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify})
-		},
-	}
-	d.client = driver115.New(opts...)
-	cr := &driver115.Credential{}
-	if err := cr.FromCookie(d.Cookie); err != nil {
-		return fmt.Errorf("parse 115 cookie: %w", err)
-	}
-	d.client.ImportCredential(cr)
-	return d.client.LoginCheck()
-}
+func (d *AliShare115) sha1Upload(ctx context.Context, fileSize int64, fileName, fullSHA1, aliyunURL, dirID string) (string, error) {
+	stream := official_115.NewUrlFileStreamer(fileName, fileSize, fullSHA1, aliyunURL)
 
-// sha1UploadTo115 performs SHA1-based rapid upload and returns the pick_code.
-func (d *AliShare115) sha1UploadTo115(ctx context.Context, fileSize int64, fileName, fullSHA1, aliyunURL, dirID string) (string, error) {
-	reader := &urlReadSeeker{
-		url:    aliyunURL,
-		client: &http.Client{Timeout: 60 * time.Second},
-		size:   fileSize,
-	}
-
-	// Pre-hash: SHA1 of first 128KB
-	const preHashSize int64 = 128 * 1024
-	readSize := preHashSize
-	if fileSize > 0 && fileSize < readSize {
-		readSize = fileSize
-	}
-	if readSize == 0 {
-		return "", fmt.Errorf("zero file size")
-	}
-
-	buf := make([]byte, int(readSize))
-	n, err := io.ReadFull(reader, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return "", fmt.Errorf("read pre-hash: %w", err)
-	}
-	reader.Seek(0, io.SeekStart)
-
-	h := sha1.New()
-	h.Write(buf[:n])
-	preHash := strings.ToUpper(hex.EncodeToString(h.Sum(nil)))
-
-	result, err := d.client.RapidUpload(fileSize, fileName, dirID, preHash, fullSHA1, reader)
+	preHash, err := computePreHash(aliyunURL, fileSize)
 	if err != nil {
-		return "", fmt.Errorf("RapidUpload: %w", err)
+		return "", fmt.Errorf("preHash: %w", err)
+	}
+
+	result, err := d.p115.RapidUploadCheck(ctx, fileSize, fileName, dirID, preHash, fullSHA1, stream)
+	if err != nil {
+		return "", fmt.Errorf("RapidUploadCheck: %w", err)
 	}
 
 	ok, err := result.Ok()
 	if err != nil {
-		return "", fmt.Errorf("check result: %w", err)
+		return "", fmt.Errorf("Ok: %w", err)
 	}
 	if !ok {
-		return "", fmt.Errorf("upload not matched (status=%d)", result.Status)
+		return "", fmt.Errorf("not matched (status=%d)", result.Status)
 	}
 
 	return result.PickCode, nil
 }
 
-// === urlReadSeeker: HTTP Range-backed io.ReadSeeker ===
-
-type urlReadSeeker struct {
-	url    string
-	client *http.Client
-	size   int64
-	offset int64
-}
-
-func (u *urlReadSeeker) Read(p []byte) (n int, err error) {
-	n, err = u.ReadAt(p, u.offset)
-	if n > 0 {
-		u.offset += int64(n)
+func computePreHash(url string, fileSize int64) (string, error) {
+	const sz int64 = 128 * 1024
+	readSize := sz
+	if fileSize > 0 && fileSize < readSize {
+		readSize = fileSize
 	}
-	return
-}
-
-func (u *urlReadSeeker) ReadAt(p []byte, off int64) (n int, err error) {
-	if u.size > 0 && off >= u.size {
-		return 0, io.EOF
-	}
-	end := off + int64(len(p)) - 1
-	if u.size > 0 && end >= u.size {
-		end = u.size - 1
+	if readSize <= 0 {
+		return "", fmt.Errorf("zero size")
 	}
 
-	req, err := http.NewRequest("GET", u.url, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", readSize-1))
 	req.Header.Set("Referer", "https://www.aliyundrive.com/")
 
-	resp, err := u.client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("http range error: %d", resp.StatusCode)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, readSize))
+	if err != nil {
+		return "", err
 	}
 
-	n, err = io.ReadFull(resp.Body, p)
-	if err == io.ErrUnexpectedEOF || err == io.EOF {
-		err = nil
-	}
-	return n, err
-}
-
-func (u *urlReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-		u.offset = offset
-	case io.SeekCurrent:
-		u.offset += offset
-	case io.SeekEnd:
-		u.offset = u.size + offset
-	default:
-		return 0, fmt.Errorf("invalid whence: %d", whence)
-	}
-	if u.offset < 0 {
-		return 0, fmt.Errorf("negative seek position")
-	}
-	return u.offset, nil
+	h := sha1.New()
+	h.Write(data)
+	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
 }
 
 var _ driver.Driver = (*AliShare115)(nil)
